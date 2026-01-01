@@ -20,7 +20,11 @@ go version  # Должно быть ≥ 1.24
 
 # Устанавливаем инструменты компонентной модели
 go install github.com/bytecodealliance/wit-bindgen/cmd/wit-bindgen-go@latest
-cargo install wit-component wasm-tools  # Rust инструменты
+cargo install wasm-tools  # Инструменты для работы с компонентами
+
+# Скачиваем WASI адаптер для преобразования модулей в компоненты
+curl -L https://github.com/bytecodealliance/wasmtime/releases/download/v40.0.0/wasi_snapshot_preview1.wasm \
+     -o wasi_snapshot_preview1.wasm
 ```
 
 2. **Код Go-компонента (`compute.go`):**
@@ -48,7 +52,7 @@ func ComputeHash(data []byte) string {
 
 ```bash
 GOOS=wasip1 GOARCH=wasm go build \
-    -buildmode=wasm \
+    -buildmode=c-shared \
     -ldflags="-s -w" \
     -o target/go_module.wasm \
     compute.go
@@ -119,26 +123,20 @@ world go-computer {
 2. **Создание компонента:**
 
 ```bash
-# 1. Скачиваем WASI адаптер (нужен для wasip1 → компонент)
-wget https://github.com/bytecodealliance/wasmtime/releases/download/v22.0.0/wasi_snapshot_preview1.reactor.wasm \
-     -O adapters/wasi_snapshot_preview1.wasm
-
-# 2. Создаем компонент
-wit-component encode \
-    --world go-computer \
-    wit/go-api.wit \
+# Создаем компонент из WASI модуля
+wasm-tools component new \
     target/go_module.wasm \
-    -o target/go_component.wasm \
-    --adapt wasi_snapshot_preview1=adapters/wasi_snapshot_preview1.wasm
+    --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.wasm \
+    -o target/go_component.wasm
 ```
 
-**Что происходит:** `wit-component` оборачивает наш модуль в компонент, добавляя метаданные типов и адаптируя WASI вызовы.
+**Что происходит:** `wasm-tools component new` оборачивает WASI модуль в компонент, добавляя метаданные типов и адаптируя WASI вызовы.
 
 ---
 
 ## Rust хост-приложение
 
-**Важное изменение:** Начиная с wasmtime 22.0, компоненты загружаются через `wasmtime component` API.
+Компоненты загружаются через `wasmtime::component` API.
 
 1. **`Cargo.toml`:**
 
@@ -150,9 +148,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-wasmtime = "22.0"
-wasmtime-wasi = "22.0"
-wasmtime-component-macro = "22.0"
+wasmtime = { version = "40.0", features = ["component-model"] }
+wasmtime-wasi = "40.0"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -160,49 +157,65 @@ tokio = { version = "1.0", features = ["full"] }
 
 ```rust
 use anyhow::Result;
-use wasmtime::*;
-use wasmtime::component::*;
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
+use wasmtime::{
+    component::{Component, Linker, ResourceTable, bindgen},
+    Config, Engine, Store,
+};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
 // Генерация биндингов из WIT
-wasmtime::component::bindgen!({
-    world: "go-computer",
-    path: "./wit/go-api.wit",
-});
+bindgen!("go-computer" in "./wit/go-api.wit");
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Конфигурация движка
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    config.async_support(true);
-    let engine = Engine::new(&config)?;
+    let engine = Engine::new(Config::new().wasm_component_model(true))?;
 
     // 2. Загрузка компонента
     let component = Component::from_file(&engine, "target/go_component.wasm")?;
 
-    // 3. Настройка WASI
-    let wasi = WasiCtxBuilder::new()
-        .inherit_stdio()
-        .inherit_args()?
-        .build();
-    let mut store = Store::new(&engine, wasi);
+    // 3. Настройка WASI контекста
+    let mut builder = WasiCtxBuilder::new();
+    builder.inherit_stdio().inherit_args()?;
+    let ctx = builder.build();
 
-    // 4. Создание линкера
-    let mut linker = Linker::new(&engine);
-    wasmtime_wasi::command::add_to_linker(&mut linker)?;
+    // 4. Создание состояния с WasiView
+    let mut store = Store::new(
+        &engine,
+        MyState {
+            ctx,
+            table: ResourceTable::new(),
+        },
+    );
 
-    // 5. Инстанцирование
-    let (instance, _) = GoComputer::instantiate_async(&mut store, &component, &linker).await?;
+    // 5. Создание линкера
+    let mut linker = Linker::<MyState>::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    // 6. Вызов Go-функции
-    let go_api = instance.go_computer();
+    // 6. Инстанцирование
+    let instance = GoComputer::instantiate_async(&mut store, &component, &linker).await?;
 
+    // 7. Вызов Go-функции
     let data = vec![1, 2, 3, 4, 5];
-    let hash: String = go_api.call_compute_hash(&mut store, &data).await?;
+    let hash: String = instance.call_compute_hash(&mut store, &data).await?;
 
     println!("Go хэш: {}", hash);
     Ok(())
+}
+
+// Структура состояния реализующая WasiView
+struct MyState {
+    ctx: WasiCtx,
+    table: ResourceTable,
+}
+
+impl WasiView for MyState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
 }
 ```
 
@@ -269,13 +282,25 @@ config.cache_config_load_default()?; // Включаем кэш
 - **Некоторые syscall**: Ограничены WASI
 - **Некоторые пакеты**: `net`, `os/exec` имеют ограниченную функциональность
 
-### **2. Ограничения компонентной модели**
+### **2. Передача строк и сложных типов**
+
+**Важно:** Go передает строки как структуру (указатель + длина), а Rust ожидает другие форматы. При передаче данных между языками через WebAssembly Component Model используется **линейная память (Linear Memory)**.
+
+- **Простые типы** (`i32`, `f64`): Передаются напрямую через регистры
+- **Строки и массивы**: Копируются в общую линейную память WASM
+- **Управление памятью**: Компонентная модель автоматически управляет копированием данных
+
+### **3. Многопоточность**
+
+WebAssembly MVP не поддерживает полноценную многопоточность. Go-горутины работают в одном потоке внутри Rust (кооперативная многозадачность). Нельзя получить параллелизм в Rust за счет Go-процедур.
+
+### **4. Ограничения компонентной модели**
 
 - **Только значения, помещающиеся в линейную память**
 - **Нет shared memory между компонентами**
 - **Ограниченная работа с файловой системой**
 
-### **3. Производительность**
+### **5. Производительность**
 
 - **Холодный старт:** 10-15ms
 - **Накладные расходы на вызов:** ~50ns
@@ -297,8 +322,13 @@ config.profiler(ProfilingStrategy::PerfMap)?;
 ```rust
 // Ограничиваем ресурсы
 let mut config = Config::new();
-config.memory_limits(256, 1024); // 256KB initial, 1MB max
 config.max_wasm_stack(64 * 1024); // 64KB стек
+
+// Для ограничения памяти используем fuel-based лимиты
+config.consume_fuel(true);
+
+// В store устанавливаем лимит fuel
+store.set_fuel(1_000_000)?; // Ограничиваем выполнение
 ```
 
 ### **3. Масштабирование**
